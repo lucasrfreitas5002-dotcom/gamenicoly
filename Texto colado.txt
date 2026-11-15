@@ -1,0 +1,25 @@
+Crie um jogo 2D de plataforma e a��o em um �nico arquivo HTML (CSS e JavaScript embutidos), inspirado nos jogos Java (J2ME) de celular cl�ssicos, com tem�tica de Jurassic Park.
+
+1. Visual retr�
+- Resolu��o interna de 240x320 px, escalada para caber na tela mantendo a propor��o, com `image-rendering: pixelated`.
+- Sem arquivos de imagem externos: desenhe tudo com Canvas (ret�ngulos, caminhos) ou matrizes de pixels.
+- Personagem: um explorador. Inimigos: Velociraptors e um T-Rex como chefe. Cen�rios: selva e laborat�rio.
+- Paleta de cores limitada, no estilo dos celulares antigos.
+
+2. Jogabilidade
+- Setas ou A/D para andar; W, Espa�o ou \u2191 para pular; Z ou Enter para atirar dardos tranquilizantes.
+- F�sica simples: gravidade, pulo e colis�o com plataformas.
+- Vida do jogador (3 cora��es) e itens de vida espalhados pelas fases.
+- Bot�es virtuais na tela (esquerda, direita, pular, atirar), vis�veis apenas em dispositivos de toque.
+
+3. Estrutura
+- Fase 1: selva com plataformas, obst�culos e Velociraptors.
+- Fase 2: laborat�rio com mais obst�culos e inimigos.
+- Chefe T-Rex no final da fase 2, com barra de vida.
+- Telas de in�cio, game over e vit�ria.
+
+4. �udio
+- Efeitos retr� de pulo, tiro, dano e rugido gerados com Web Audio API (osciladores e envelopes), sem arquivos externos.
+- Iniciar o �udio s� depois do primeiro clique ou toque, por causa da pol�tica dos navegadores.
+
+Entregue o c�digo completo em um �nico bloco, com coment�rios curtos em cada se��o.

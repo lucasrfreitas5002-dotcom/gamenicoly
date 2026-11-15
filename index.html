@@ -35,7 +35,6 @@
 const SPRITE_SRC = "";
 
 // Retângulo de cada sprite dentro da folha (x, y, largura, altura), em pixels da imagem.
-// Ajuste conforme a sua folha de sprites.
 const SHEET = {
   player: { x: 0,  y: 0,  w: 16, h: 16 },
   raptor: { x: 16, y: 0,  w: 16, h: 16 },
@@ -49,12 +48,29 @@ const HUD_H = 16;
 const MAX_HP = 3;
 
 const PLAYER_SPEED = 70;     // px por segundo
-const DART_SPEED = 220;      // px por segundo
-const DART_COOLDOWN = 0.3;   // segundos entre tiros
 const INVULN_TIME = 1.0;     // invulnerabilidade após tomar dano
 
-const MSG_TIME = 2.0;
-const NICOLY_MSG = "PARABÉNS NICOLY!";
+// Alertas no topo: aparecem só quando um dinossauro morre
+const ALERT_TIME = 2.5;      // segundos que cada alerta fica na tela
+const MAX_ALERTS = 3;        // quantos alertas podem aparecer ao mesmo tempo
+const DEATH_MSGS = [
+  "PARABÉNS NICOLY!",
+  "cuidado com o professor",
+  "você deveria estar estudando né não?!",
+  "esse é o melhor jogo do mundo eu sei",
+  "na última vez que você jogou você tinha passado dessa fase mais rápido",
+];
+const GAMEOVER_LINES = ["hiiiii sério que tu morreu?", "kkkkkkkkkkkk"];
+
+// Armas. maxAmmo Infinity = munição ilimitada.
+// stun = segundos paralisado; push = empurrão em px.
+const WEAPONS = {
+  shock:  { name: "SHOCK",  cooldown: 0.5, speed: 240, life: 0.2, dmg: 1, stun: 1.0, push: 0,  color: "#5ee7ff", maxAmmo: Infinity, minStage: 1, w: 4, h: 4 },
+  dart:   { name: "DARDO",  cooldown: 0.3, speed: 220, life: 1.0, dmg: 1, stun: 0,   push: 0,  color: "#ffe066", maxAmmo: Infinity, minStage: 1, w: 3, h: 2 },
+  sniper: { name: "SNIPER", cooldown: 0.6, speed: 420, life: 1.0, dmg: 1, stun: 2.0, push: 36, color: "#ff6b6b", maxAmmo: 3,        minStage: 2, w: 6, h: 2 },
+};
+const WEAPON_ORDER = ["shock", "dart", "sniper"];
+const WEAPON_KEYS = { "1": "shock", "2": "dart", "3": "sniper" };
 
 // Tipos de tile: 0 grama, 1 árvore, 2 pedra, 3 piso do lab, 4 parede do lab
 const SOLID = new Set([1, 2, 4]);
@@ -95,6 +111,24 @@ function mulberry32(seed) {
   };
 }
 
+// Quebra um texto em linhas que caibam em maxW (usa a fonte atual do ctx)
+function wrapText(text, maxW) {
+  const words = text.split(" ");
+  const lines = [];
+  let line = "";
+  for (const w of words) {
+    const test = line ? line + " " + w : w;
+    if (ctx.measureText(test).width > maxW && line) {
+      lines.push(line);
+      line = w;
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 /* ==================================================
    ÁUDIO (Web Audio API, sem arquivos externos)
    ================================================== */
@@ -128,6 +162,12 @@ function tone(f1, f2, dur, type, vol, delay = 0) {
 function sfx(name) {
   switch (name) {
     case "shoot":  tone(900, 200, 0.12, "square", 0.08); break;
+    case "shock":
+      tone(1400, 200, 0.18, "sawtooth", 0.07);
+      tone(120, 60, 0.12, "square", 0.05, 0.03);
+      break;
+    case "snipe":  tone(700, 110, 0.22, "square", 0.09); break;
+    case "switch": tone(520, 780, 0.06, "square", 0.05); break;
     case "hurt":   tone(320, 60, 0.25, "sawtooth", 0.15); break;
     case "roar":   tone(140, 45, 0.8, "sawtooth", 0.18); tone(90, 40, 0.8, "square", 0.07); break;
     case "pickup":
@@ -157,6 +197,7 @@ window.addEventListener("keydown", (e) => {
   ensureAudio();
   const k = keyName(e);
   if (KEY_DIR[k]) { keys[KEY_DIR[k]] = true; e.preventDefault(); }
+  if (WEAPON_KEYS[k]) selectWeapon(WEAPON_KEYS[k]);
   if (KEY_FIRE[k]) {
     keys.fire = true;
     e.preventDefault();
@@ -172,11 +213,12 @@ window.addEventListener("blur", () => { for (const k in keys) keys[k] = false; }
 
 // Botões virtuais (coordenadas da tela 240x320)
 const TOUCH_BTNS = [
-  { id: "up",    label: "^",    cx: 46,  cy: 246, r: 14 },
-  { id: "down",  label: "v",    cx: 46,  cy: 306, r: 14 },
-  { id: "left",  label: "<",    cx: 20,  cy: 276, r: 14 },
-  { id: "right", label: ">",    cx: 72,  cy: 276, r: 14 },
-  { id: "fire",  label: "TIRO", cx: 200, cy: 280, r: 20 },
+  { id: "up",     label: "^",    cx: 46,  cy: 246, r: 14 },
+  { id: "down",   label: "v",    cx: 46,  cy: 306, r: 14 },
+  { id: "left",   label: "<",    cx: 20,  cy: 276, r: 14 },
+  { id: "right",  label: ">",    cx: 72,  cy: 276, r: 14 },
+  { id: "weapon", label: "ARMA", cx: 136, cy: 290, r: 13 },
+  { id: "fire",   label: "TIRO", cx: 200, cy: 280, r: 20 },
 ];
 
 const pointers = new Map();
@@ -187,9 +229,18 @@ function toView(e) {
     y: (e.clientY - r.top) * (VIEW_H / r.height),
   };
 }
+function hitBtn(pt, b) {
+  return Math.hypot(pt.x - b.cx, pt.y - b.cy) <= b.r + 6;
+}
 canvas.addEventListener("pointerdown", (e) => {
   ensureAudio();
-  pointers.set(e.pointerId, toView(e));
+  const pt = toView(e);
+  pointers.set(e.pointerId, pt);
+  if (state === "playing") {
+    for (const b of TOUCH_BTNS) {
+      if (b.id === "weapon" && hitBtn(pt, b)) cycleWeapon();
+    }
+  }
   onConfirm();
   e.preventDefault();
 });
@@ -200,11 +251,13 @@ const releasePointer = (e) => pointers.delete(e.pointerId);
 window.addEventListener("pointerup", releasePointer);
 window.addEventListener("pointercancel", releasePointer);
 
+// Botões de movimento e tiro mantidos pressionados (o botão de arma é tratado no toque)
 function touchPressed() {
   const p = { up: false, down: false, left: false, right: false, fire: false };
   for (const pt of pointers.values()) {
     for (const b of TOUCH_BTNS) {
-      if (Math.hypot(pt.x - b.cx, pt.y - b.cy) <= b.r + 6) p[b.id] = true;
+      if (b.id === "weapon") continue;
+      if (hitBtn(pt, b)) p[b.id] = true;
     }
   }
   return p;
@@ -228,17 +281,132 @@ function readInput() {
 let state = "title";      // title | playing | clear | gameover | win
 let stage = 1;
 let clearTimer = 0;
-let msgTimer = 0;
-let msgText = "";
+let alerts = [];          // avisos no topo: { text, t }
+let lastAlert = -1;
 let camX = 0, camY = 0;
 let lastTime = performance.now();
 
 let map = null;           // { w, h, tiles }
 let player = null;        // { x, y, hw, hh, hp, invuln, cooldown } (x, y = centro)
 let enemies = [];
-let darts = [];
+let darts = [];           // projéteis (dardo, shock e sniper)
 let hearts = [];
 let facing = { x: 0, y: 1 };
+let weapon = "shock";     // arma atual
+let ammo = {};            // munição por arma
+
+/* ==================================================
+   ARMAS
+   ================================================== */
+
+function unlocked(id) {
+  return WEAPONS[id].minStage <= stage;
+}
+
+function selectWeapon(id) {
+  if (!WEAPONS[id] || !unlocked(id) || id === weapon) return;
+  weapon = id;
+  sfx("switch");
+}
+
+function cycleWeapon() {
+  const avail = WEAPON_ORDER.filter(unlocked);
+  const i = avail.indexOf(weapon);
+  weapon = avail[(i + 1) % avail.length];
+  sfx("switch");
+}
+
+function tryFire() {
+  if (player.cooldown > 0) return;
+  if (ammo[weapon] <= 0) return;
+  const w = WEAPONS[weapon];
+  ammo[weapon]--;
+  player.cooldown = w.cooldown;
+  darts.push({
+    x: player.x + facing.x * 9,
+    y: player.y + facing.y * 9,
+    vx: facing.x * w.speed,
+    vy: facing.y * w.speed,
+    life: w.life,
+    dmg: w.dmg,
+    stun: w.stun,
+    push: w.push,
+    color: w.color,
+    w: w.w, h: w.h,
+    dirx: facing.x, diry: facing.y,
+    kind: weapon,
+  });
+  if (weapon === "shock") sfx("shock");
+  else if (weapon === "sniper") sfx("snipe");
+  else sfx("shoot");
+}
+
+function updateDarts(dt) {
+  for (let i = darts.length - 1; i >= 0; i--) {
+    const d = darts[i];
+    d.x += d.vx * dt;
+    d.y += d.vy * dt;
+    d.life -= dt;
+
+    let gone = d.life <= 0 || solidAt(Math.floor(d.x / TILE), Math.floor(d.y / TILE));
+    if (!gone) {
+      for (const en of enemies) {
+        if (Math.abs(d.x - en.x) < en.hw + 2 && Math.abs(d.y - en.y) < en.hh + 2) {
+          hitEnemy(en, d);
+          gone = true;
+          break;
+        }
+      }
+    }
+    if (gone) darts.splice(i, 1);
+  }
+}
+
+function hitEnemy(en, d) {
+  en.hp -= d.dmg;
+  en.flash = 0.12;
+  if (d.stun) en.stunT = Math.max(en.stunT, d.stun);
+  if (d.push) {
+    // Empurra em pequenos passos para não atravessar paredes
+    const steps = 6;
+    for (let i = 0; i < steps; i++) {
+      moveBox(en, d.dirx * d.push / steps, d.diry * d.push / steps);
+    }
+  }
+  if (en.hp <= 0) killEnemy(en);
+}
+
+/* ==================================================
+   AVISOS NO TOPO
+   ================================================== */
+
+function pushAlert() {
+  let i;
+  do { i = Math.floor(Math.random() * DEATH_MSGS.length); }
+  while (i === lastAlert && DEATH_MSGS.length > 1);
+  lastAlert = i;
+  alerts.push({ text: DEATH_MSGS[i], t: ALERT_TIME });
+  if (alerts.length > MAX_ALERTS) alerts.shift();
+}
+
+function drawAlerts() {
+  if (alerts.length === 0) return;
+  ctx.font = "bold 8px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  let y = HUD_H + 4;
+  for (const a of alerts) {
+    const lines = wrapText(a.text, VIEW_W - 40);
+    const h = lines.length * 10 + 6;
+    ctx.fillStyle = "rgba(0,0,0,0.78)";
+    ctx.fillRect(16, y, VIEW_W - 32, h);
+    ctx.fillStyle = "#ffd54a";
+    lines.forEach((ln, i) => ctx.fillText(ln, VIEW_W / 2, y + 8 + i * 10));
+    y += h + 3;
+  }
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
 
 /* ==================================================
    GERAÇÃO DAS FASES
@@ -329,12 +497,12 @@ function buildStage(n) {
 
 function makeRaptor(x, y) {
   return { kind: "raptor", x, y, hw: 6, hh: 6, hp: 2, speed: 42, chase: 120,
-           wanderT: 0, wx: 0, wy: 0, flash: 0 };
+           wanderT: 0, wx: 0, wy: 0, flash: 0, stunT: 0 };
 }
 
 function makeTrex(x, y) {
   return { kind: "trex", x, y, hw: 12, hh: 12, hp: 12, maxHp: 12, speed: 26, chase: 260,
-           wanderT: 0, wx: 0, wy: 0, flash: 0, roarT: 1.5 };
+           wanderT: 0, wx: 0, wy: 0, flash: 0, stunT: 0, roarT: 1.5 };
 }
 
 function loadStage() {
@@ -343,6 +511,9 @@ function loadStage() {
   enemies = d.enemies;
   hearts = d.hearts;
   darts = [];
+  // Munição reseta a cada fase
+  ammo = {};
+  for (const id in WEAPONS) ammo[id] = WEAPONS[id].maxAmmo;
   const hp = player ? player.hp : MAX_HP;
   player = { x: d.spawnX, y: d.spawnY, hw: 5, hh: 5, hp, invuln: 0, cooldown: 0 };
   facing = { x: 0, y: 1 };
@@ -385,6 +556,9 @@ function overlap(a, b) {
 function updateEnemy(en, dt) {
   if (en.flash > 0) en.flash -= dt;
 
+  // Paralisado: não se move nem ataca
+  if (en.stunT > 0) { en.stunT -= dt; return; }
+
   const dx = player.x - en.x, dy = player.y - en.y;
   const dist = Math.hypot(dx, dy);
   let vx = 0, vy = 0, sp = en.speed;
@@ -413,48 +587,8 @@ function updateEnemy(en, dt) {
 function killEnemy(en) {
   const idx = enemies.indexOf(en);
   if (idx >= 0) enemies.splice(idx, 1);
-  msgText = NICOLY_MSG;
-  msgTimer = MSG_TIME;
+  pushAlert();
   sfx("death");
-}
-
-/* ==================================================
-   DARDOS
-   ================================================== */
-
-function shoot() {
-  player.cooldown = DART_COOLDOWN;
-  darts.push({
-    x: player.x + facing.x * 9,
-    y: player.y + facing.y * 9,
-    vx: facing.x * DART_SPEED,
-    vy: facing.y * DART_SPEED,
-    life: 1.0,
-  });
-  sfx("shoot");
-}
-
-function updateDarts(dt) {
-  for (let i = darts.length - 1; i >= 0; i--) {
-    const d = darts[i];
-    d.x += d.vx * dt;
-    d.y += d.vy * dt;
-    d.life -= dt;
-
-    let gone = d.life <= 0 || solidAt(Math.floor(d.x / TILE), Math.floor(d.y / TILE));
-    if (!gone) {
-      for (const en of enemies) {
-        if (Math.abs(d.x - en.x) < en.hw + 2 && Math.abs(d.y - en.y) < en.hh + 2) {
-          en.hp -= 1;
-          en.flash = 0.12;
-          gone = true;
-          if (en.hp <= 0) killEnemy(en);
-          break;
-        }
-      }
-    }
-    if (gone) darts.splice(i, 1);
-  }
 }
 
 /* ==================================================
@@ -485,15 +619,15 @@ function updatePlaying(dt) {
 
   player.invuln = Math.max(0, player.invuln - dt);
   player.cooldown = Math.max(0, player.cooldown - dt);
-  if (inp.fire && player.cooldown <= 0) shoot();
+  if (inp.fire) tryFire();
 
   updateDarts(dt);
   for (const en of enemies) updateEnemy(en, dt);
 
-  // Contato com dinossauro
+  // Contato com dinossauro (paralisados não atacam)
   if (player.invuln <= 0) {
     for (const en of enemies) {
-      if (overlap(player, en)) { hurtPlayer(); break; }
+      if (en.stunT <= 0 && overlap(player, en)) { hurtPlayer(); break; }
     }
   }
   if (state !== "playing") return;
@@ -517,7 +651,9 @@ function updatePlaying(dt) {
 }
 
 function update(dt) {
-  if (msgTimer > 0) msgTimer -= dt;
+  // Avisos no topo somem sozinhos
+  for (const a of alerts) a.t -= dt;
+  alerts = alerts.filter((a) => a.t > 0);
 
   if (state === "playing") {
     updatePlaying(dt);
@@ -538,7 +674,8 @@ function update(dt) {
 function startGame() {
   stage = 1;
   player = null;
-  msgTimer = 0;
+  weapon = "shock";      // o personagem começa com o shock
+  alerts = [];
   loadStage();
   state = "playing";
 }
@@ -661,6 +798,14 @@ function drawHUD() {
   for (let i = 0; i < MAX_HP; i++) {
     drawHeartIcon(4 + i * 10, 4, i < player.hp ? "#e0282e" : "#4a4a4a");
   }
+
+  // Arma atual e munição
+  const w = WEAPONS[weapon];
+  const info = w.maxAmmo === Infinity ? w.name : `${w.name} ${ammo[weapon]}`;
+  ctx.fillStyle = w.color;
+  ctx.font = "8px monospace";
+  ctx.fillText(info, 40, 11);
+
   ctx.fillStyle = "#fff";
   ctx.font = "8px monospace";
   ctx.textAlign = "right";
@@ -681,16 +826,17 @@ function drawHUD() {
 function drawTouch() {
   const p = touchPressed();
   for (const b of TOUCH_BTNS) {
+    const held = b.id === "weapon" ? false : p[b.id];
     ctx.beginPath();
     ctx.arc(b.cx, b.cy, b.r, 0, Math.PI * 2);
-    ctx.fillStyle = p[b.id] ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.18)";
+    ctx.fillStyle = held ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.18)";
     ctx.fill();
     ctx.strokeStyle = "rgba(255,255,255,0.5)";
     ctx.lineWidth = 1;
     ctx.stroke();
   }
   ctx.fillStyle = "#fff";
-  ctx.font = "bold 10px monospace";
+  ctx.font = "bold 9px monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   for (const b of TOUCH_BTNS) ctx.fillText(b.label, b.cx, b.cy);
@@ -717,35 +863,22 @@ function drawTitle() {
   ctx.fillStyle = "#cfe8c4";
   ctx.font = "8px monospace";
   ctx.fillText("Setas / WASD: andar", VIEW_W / 2, 210);
-  ctx.fillText("Z / ENTER: atirar dardo", VIEW_W / 2, 224);
-  ctx.fillText("Derrote os dinossauros!", VIEW_W / 2, 238);
+  ctx.fillText("Z / ENTER: atirar", VIEW_W / 2, 224);
+  ctx.fillText("1, 2, 3: trocar de arma", VIEW_W / 2, 238);
   ctx.textAlign = "left";
 }
 
-function drawOverlay(title, color, sub) {
+function drawOverlay(title, color, lines) {
   ctx.fillStyle = "rgba(0,0,0,0.6)";
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   ctx.textAlign = "center";
   ctx.fillStyle = color;
   ctx.font = "bold 18px monospace";
-  ctx.fillText(title, VIEW_W / 2, 130);
+  ctx.fillText(title, VIEW_W / 2, 120);
   ctx.fillStyle = "#fff";
   ctx.font = "9px monospace";
-  ctx.fillText(sub, VIEW_W / 2, 262);
+  lines.forEach((ln, i) => ctx.fillText(ln, VIEW_W / 2, 160 + i * 16));
   ctx.textAlign = "left";
-}
-
-function drawMessage() {
-  if (msgTimer <= 0) return;
-  ctx.fillStyle = "rgba(0,0,0,0.75)";
-  ctx.fillRect(16, 140, VIEW_W - 32, 36);
-  ctx.fillStyle = "#ffd54a";
-  ctx.font = "bold 16px monospace";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(msgText, VIEW_W / 2, 158);
-  ctx.textAlign = "left";
-  ctx.textBaseline = "alphabetic";
 }
 
 function render() {
@@ -768,12 +901,14 @@ function render() {
   for (const en of enemies) {
     const flip = player.x < en.x;
     const base = en.kind === "trex" ? "#7a5a2a" : "#6aa84f";
-    drawEntity(en.kind, en.x, en.y, en.flash > 0 ? "#ffffff" : base, flip);
+    const color = en.flash > 0 ? "#ffffff" : en.stunT > 0 ? "#8fd8ff" : base;
+    drawEntity(en.kind, en.x, en.y, color, flip);
   }
 
-  ctx.fillStyle = "#ffe066";
+  // Projéteis, cada arma com seu formato e cor
   for (const d of darts) {
-    ctx.fillRect(Math.round(d.x - camX) - 1, Math.round(d.y - camY) - 1, 3, 2);
+    ctx.fillStyle = d.color;
+    ctx.fillRect(Math.round(d.x - camX - d.w / 2), Math.round(d.y - camY - d.h / 2), d.w, d.h);
   }
 
   // Jogador pisca enquanto está invulnerável
@@ -781,6 +916,7 @@ function render() {
   if (!blink) drawEntity("player", player.x, player.y, null, facing.x < 0);
 
   drawHUD();
+  drawAlerts();
   if (isTouch && state === "playing") drawTouch();
 
   if (state === "clear") {
@@ -790,10 +926,12 @@ function render() {
     ctx.fillText(`FASE ${stage} COMPLETA!`, VIEW_W / 2, 60);
     ctx.textAlign = "left";
   }
-  if (state === "gameover") drawOverlay("GAME OVER", "#ff5252", "Toque ou ENTER para recomeçar");
-  if (state === "win") drawOverlay("VOCÊ VENCEU!", "#7cff6b", "Toque ou ENTER para jogar de novo");
-
-  drawMessage();
+  if (state === "gameover") {
+    drawOverlay("GAME OVER", "#ff5252", [...GAMEOVER_LINES, "", "Toque ou ENTER para recomeçar"]);
+  }
+  if (state === "win") {
+    drawOverlay("VOCÊ VENCEU!", "#7cff6b", ["Toque ou ENTER para jogar de novo"]);
+  }
 }
 
 /* ==================================================
