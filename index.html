@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Jurassic Escape</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    width: min(100vw, 75vh);   /* mantém proporção 3:4 dentro da tela */
+    height: auto;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+"use strict";
+
+/* ==================================================
+   CONFIGURAÇÕES — ajuste aqui
+   ================================================== */
+
+// Cole aqui o data URI (base64) da sua imagem de sprites.
+// Exemplo: "data:image/jpeg;base64,/9j/4AAQSk..."
+// Deixe vazio ("") para usar formas desenhadas no lugar.
+const SPRITE_SRC = "";
+
+// Retângulo de cada sprite dentro da folha (x, y, largura, altura), em pixels da imagem.
+// Ajuste conforme a sua folha de sprites.
+const SHEET = {
+  player: { x: 0,  y: 0,  w: 16, h: 16 },
+  raptor: { x: 16, y: 0,  w: 16, h: 16 },
+  trex:   { x: 0,  y: 16, w: 32, h: 32 },
+  heart:  { x: 32, y: 0,  w: 8,  h: 8  },
+};
+
+const VIEW_W = 240, VIEW_H = 320;   // resolução interna
+const TILE = 16;
+const HUD_H = 16;
+const MAX_HP = 3;
+
+const PLAYER_SPEED = 70;     // px por segundo
+const DART_SPEED = 220;      // px por segundo
+const DART_COOLDOWN = 0.3;   // segundos entre tiros
+const INVULN_TIME = 1.0;     // invulnerabilidade após tomar dano
+
+const MSG_TIME = 2.0;
+const NICOLY_MSG = "PARABÉNS NICOLY!";
+
+// Tipos de tile: 0 grama, 1 árvore, 2 pedra, 3 piso do lab, 4 parede do lab
+const SOLID = new Set([1, 2, 4]);
+
+/* ==================================================
+   CANVAS E IMAGEM
+   ================================================== */
+
+const canvas = document.getElementById("game");
+canvas.width = VIEW_W;
+canvas.height = VIEW_H;
+const ctx = canvas.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const isTouch = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
+
+const sprites = { img: null, ok: false };
+if (SPRITE_SRC) {
+  const img = new Image();
+  img.onload = () => { sprites.img = img; sprites.ok = true; };
+  img.onerror = () => console.warn("Imagem de sprites não carregou; usando formas.");
+  img.src = SPRITE_SRC;
+}
+
+/* ==================================================
+   UTILIDADES
+   ================================================== */
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// Gerador pseudoaleatório com semente (para as fases)
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ==================================================
+   ÁUDIO (Web Audio API, sem arquivos externos)
+   ================================================== */
+
+let actx = null;
+function ensureAudio() {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {
+    actx = null;
+  }
+}
+
+function tone(f1, f2, dur, type, vol, delay = 0) {
+  if (!actx) return;
+  const t = actx.currentTime + delay;
+  const o = actx.createOscillator();
+  const g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f1, t);
+  o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g);
+  g.connect(actx.destination);
+  o.start(t);
+  o.stop(t + dur + 0.02);
+}
+
+function sfx(name) {
+  switch (name) {
+    case "shoot":  tone(900, 200, 0.12, "square", 0.08); break;
+    case "hurt":   tone(320, 60, 0.25, "sawtooth", 0.15); break;
+    case "roar":   tone(140, 45, 0.8, "sawtooth", 0.18); tone(90, 40, 0.8, "square", 0.07); break;
+    case "pickup":
+      tone(660, 660, 0.08, "square", 0.08, 0);
+      tone(990, 990, 0.12, "square", 0.08, 0.08);
+      break;
+    case "death":  tone(420, 40, 0.6, "triangle", 0.2); tone(210, 30, 0.6, "square", 0.07); break;
+    case "clear":
+      [523, 659, 784, 1046].forEach((f, i) => tone(f, f, 0.14, "square", 0.08, i * 0.12));
+      break;
+  }
+}
+
+/* ==================================================
+   ENTRADA (teclado e toque)
+   ================================================== */
+
+const keys = { up: false, down: false, left: false, right: false, fire: false };
+const KEY_DIR = {
+  ArrowUp: "up", w: "up", ArrowDown: "down", s: "down",
+  ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right",
+};
+const KEY_FIRE = { z: true, Enter: true };
+function keyName(e) { return e.key.length === 1 ? e.key.toLowerCase() : e.key; }
+
+window.addEventListener("keydown", (e) => {
+  ensureAudio();
+  const k = keyName(e);
+  if (KEY_DIR[k]) { keys[KEY_DIR[k]] = true; e.preventDefault(); }
+  if (KEY_FIRE[k]) {
+    keys.fire = true;
+    e.preventDefault();
+    if (!e.repeat) onConfirm();
+  }
+});
+window.addEventListener("keyup", (e) => {
+  const k = keyName(e);
+  if (KEY_DIR[k]) keys[KEY_DIR[k]] = false;
+  if (KEY_FIRE[k]) keys.fire = false;
+});
+window.addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+
+// Botões virtuais (coordenadas da tela 240x320)
+const TOUCH_BTNS = [
+  { id: "up",    label: "^",    cx: 46,  cy: 246, r: 14 },
+  { id: "down",  label: "v",    cx: 46,  cy: 306, r: 14 },
+  { id: "left",  label: "<",    cx: 20,  cy: 276, r: 14 },
+  { id: "right", label: ">",    cx: 72,  cy: 276, r: 14 },
+  { id: "fire",  label: "TIRO", cx: 200, cy: 280, r: 20 },
+];
+
+const pointers = new Map();
+function toView(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * (VIEW_W / r.width),
+    y: (e.clientY - r.top) * (VIEW_H / r.height),
+  };
+}
+canvas.addEventListener("pointerdown", (e) => {
+  ensureAudio();
+  pointers.set(e.pointerId, toView(e));
+  onConfirm();
+  e.preventDefault();
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, toView(e));
+});
+const releasePointer = (e) => pointers.delete(e.pointerId);
+window.addEventListener("pointerup", releasePointer);
+window.addEventListener("pointercancel", releasePointer);
+
+function touchPressed() {
+  const p = { up: false, down: false, left: false, right: false, fire: false };
+  for (const pt of pointers.values()) {
+    for (const b of TOUCH_BTNS) {
+      if (Math.hypot(pt.x - b.cx, pt.y - b.cy) <= b.r + 6) p[b.id] = true;
+    }
+  }
+  return p;
+}
+
+function readInput() {
+  const t = isTouch ? touchPressed() : { up: false, down: false, left: false, right: false, fire: false };
+  const up = keys.up || t.up, down = keys.down || t.down;
+  const left = keys.left || t.left, right = keys.right || t.right;
+  return {
+    dx: (right ? 1 : 0) - (left ? 1 : 0),
+    dy: (down ? 1 : 0) - (up ? 1 : 0),
+    fire: keys.fire || t.fire,
+  };
+}
+
+/* ==================================================
+   ESTADO DO JOGO
+   ================================================== */
+
+let state = "title";      // title | playing | clear | gameover | win
+let stage = 1;
+let clearTimer = 0;
+let msgTimer = 0;
+let msgText = "";
+let camX = 0, camY = 0;
+let lastTime = performance.now();
+
+let map = null;           // { w, h, tiles }
+let player = null;        // { x, y, hw, hh, hp, invuln, cooldown } (x, y = centro)
+let enemies = [];
+let darts = [];
+let hearts = [];
+let facing = { x: 0, y: 1 };
+
+/* ==================================================
+   GERAÇÃO DAS FASES
+   ================================================== */
+
+function buildStage(n) {
+  const rnd = mulberry32((Math.random() * 4294967296) >>> 0);
+  const rint = (a, b) => a + Math.floor(rnd() * (b - a + 1)); // inclusivo
+
+  const W = n === 1 ? 36 : 30;
+  const H = n === 1 ? 44 : 40;
+  const tiles = new Uint8Array(W * H);
+  const set = (x, y, v) => { if (x >= 0 && y >= 0 && x < W && y < H) tiles[y * W + x] = v; };
+
+  const spawnX = Math.floor(W / 2), spawnY = H - 6;
+  const nearSpawn = (x, y) => Math.abs(x - spawnX) <= 3 && Math.abs(y - spawnY) <= 3;
+
+  if (n === 1) {
+    // Fase 1 — selva: grama, árvores na borda e obstáculos espalhados
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const border = x === 0 || y === 0 || x === W - 1 || y === H - 1;
+      set(x, y, border ? 1 : 0);
+    }
+    for (let i = 0; i < 80; i++) {
+      const x = rint(2, W - 3), y = rint(2, H - 3);
+      if (nearSpawn(x, y)) continue;
+      set(x, y, rnd() < 0.6 ? 1 : 2);
+    }
+  } else {
+    // Fase 2 — laboratório: piso, paredes na borda e divisórias
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const border = x === 0 || y === 0 || x === W - 1 || y === H - 1;
+      set(x, y, border ? 4 : 3);
+    }
+    for (let i = 0; i < 14; i++) {
+      const horiz = rnd() < 0.5;
+      const len = rint(3, 6);
+      const x0 = rint(2, W - 3), y0 = rint(2, H - 11);
+      for (let k = 0; k < len; k++) {
+        const x = horiz ? x0 + k : x0;
+        const y = horiz ? y0 : y0 + k;
+        if (y <= H - 10 && !nearSpawn(x, y)) set(x, y, 4);
+      }
+    }
+    // Área do chefe livre de paredes
+    for (let y = 2; y <= 5; y++) for (let x = spawnX - 2; x <= spawnX + 2; x++) set(x, y, 3);
+    // Parede da sala do T-Rex, com abertura no meio
+    for (let x = 2; x < W - 2; x++) {
+      if (Math.abs(x - spawnX) > 1) set(x, 8, 4);
+    }
+  }
+
+  const isFree = (x, y) =>
+    x > 0 && y > 0 && x < W - 1 && y < H - 1 && !SOLID.has(tiles[y * W + x]);
+
+  const freeTile = (minDist) => {
+    for (let tries = 0; tries < 800; tries++) {
+      const x = rint(1, W - 2), y = rint(1, H - 2);
+      if (!isFree(x, y)) continue;
+      if (Math.hypot(x - spawnX, y - spawnY) < minDist) continue;
+      return { x, y };
+    }
+    return { x: 2, y: 2 };
+  };
+  const center = (t) => ({ x: (t.x + 0.5) * TILE, y: (t.y + 0.5) * TILE });
+
+  const newEnemies = [];
+  const raptorCount = n === 1 ? 5 : 4;
+  for (let i = 0; i < raptorCount; i++) {
+    const p = center(freeTile(8));
+    newEnemies.push(makeRaptor(p.x, p.y));
+  }
+  if (n === 2) {
+    newEnemies.push(makeTrex((spawnX + 0.5) * TILE, 4.5 * TILE));
+  }
+
+  const newHearts = [];
+  for (let i = 0; i < 2; i++) newHearts.push(center(freeTile(5)));
+
+  return {
+    w: W, h: H, tiles,
+    enemies: newEnemies,
+    hearts: newHearts,
+    spawnX: (spawnX + 0.5) * TILE,
+    spawnY: (spawnY + 0.5) * TILE,
+  };
+}
+
+function makeRaptor(x, y) {
+  return { kind: "raptor", x, y, hw: 6, hh: 6, hp: 2, speed: 42, chase: 120,
+           wanderT: 0, wx: 0, wy: 0, flash: 0 };
+}
+
+function makeTrex(x, y) {
+  return { kind: "trex", x, y, hw: 12, hh: 12, hp: 12, maxHp: 12, speed: 26, chase: 260,
+           wanderT: 0, wx: 0, wy: 0, flash: 0, roarT: 1.5 };
+}
+
+function loadStage() {
+  const d = buildStage(stage);
+  map = { w: d.w, h: d.h, tiles: d.tiles };
+  enemies = d.enemies;
+  hearts = d.hearts;
+  darts = [];
+  const hp = player ? player.hp : MAX_HP;
+  player = { x: d.spawnX, y: d.spawnY, hw: 5, hh: 5, hp, invuln: 0, cooldown: 0 };
+  facing = { x: 0, y: 1 };
+}
+
+/* ==================================================
+   FÍSICA E COLISÃO
+   ================================================== */
+
+function solidAt(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= map.w || ty >= map.h) return true;
+  return SOLID.has(map.tiles[ty * map.w + tx]);
+}
+
+function boxHitsWall(e) {
+  const x0 = Math.floor((e.x - e.hw) / TILE), x1 = Math.floor((e.x + e.hw - 0.01) / TILE);
+  const y0 = Math.floor((e.y - e.hh) / TILE), y1 = Math.floor((e.y + e.hh - 0.01) / TILE);
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (solidAt(tx, ty)) return true;
+    }
+  }
+  return false;
+}
+
+// Move eixo a eixo, para deslizar nas paredes
+function moveBox(e, dx, dy) {
+  e.x += dx; if (boxHitsWall(e)) e.x -= dx;
+  e.y += dy; if (boxHitsWall(e)) e.y -= dy;
+}
+
+function overlap(a, b) {
+  return Math.abs(a.x - b.x) < a.hw + b.hw && Math.abs(a.y - b.y) < a.hh + b.hh;
+}
+
+/* ==================================================
+   INIMIGOS
+   ================================================== */
+
+function updateEnemy(en, dt) {
+  if (en.flash > 0) en.flash -= dt;
+
+  const dx = player.x - en.x, dy = player.y - en.y;
+  const dist = Math.hypot(dx, dy);
+  let vx = 0, vy = 0, sp = en.speed;
+
+  if (dist < en.chase && dist > 0.001) {
+    // Persegue o jogador
+    vx = dx / dist; vy = dy / dist;
+  } else {
+    // Vagueia
+    en.wanderT -= dt;
+    if (en.wanderT <= 0) {
+      const a = Math.random() * Math.PI * 2;
+      en.wx = Math.cos(a); en.wy = Math.sin(a);
+      en.wanderT = 1 + Math.random() * 2;
+    }
+    vx = en.wx; vy = en.wy; sp = en.speed * 0.4;
+  }
+  moveBox(en, vx * sp * dt, vy * sp * dt);
+
+  if (en.kind === "trex") {
+    en.roarT -= dt;
+    if (en.roarT <= 0) { sfx("roar"); en.roarT = 3 + Math.random() * 2; }
+  }
+}
+
+function killEnemy(en) {
+  const idx = enemies.indexOf(en);
+  if (idx >= 0) enemies.splice(idx, 1);
+  msgText = NICOLY_MSG;
+  msgTimer = MSG_TIME;
+  sfx("death");
+}
+
+/* ==================================================
+   DARDOS
+   ================================================== */
+
+function shoot() {
+  player.cooldown = DART_COOLDOWN;
+  darts.push({
+    x: player.x + facing.x * 9,
+    y: player.y + facing.y * 9,
+    vx: facing.x * DART_SPEED,
+    vy: facing.y * DART_SPEED,
+    life: 1.0,
+  });
+  sfx("shoot");
+}
+
+function updateDarts(dt) {
+  for (let i = darts.length - 1; i >= 0; i--) {
+    const d = darts[i];
+    d.x += d.vx * dt;
+    d.y += d.vy * dt;
+    d.life -= dt;
+
+    let gone = d.life <= 0 || solidAt(Math.floor(d.x / TILE), Math.floor(d.y / TILE));
+    if (!gone) {
+      for (const en of enemies) {
+        if (Math.abs(d.x - en.x) < en.hw + 2 && Math.abs(d.y - en.y) < en.hh + 2) {
+          en.hp -= 1;
+          en.flash = 0.12;
+          gone = true;
+          if (en.hp <= 0) killEnemy(en);
+          break;
+        }
+      }
+    }
+    if (gone) darts.splice(i, 1);
+  }
+}
+
+/* ==================================================
+   JOGADOR E ATUALIZAÇÃO DO JOGO
+   ================================================== */
+
+function hurtPlayer() {
+  player.hp -= 1;
+  player.invuln = INVULN_TIME;
+  sfx("hurt");
+  if (player.hp <= 0) {
+    player.hp = 0;
+    state = "gameover";
+  }
+}
+
+function updatePlaying(dt) {
+  const inp = readInput();
+
+  // Movimento em 8 direções com velocidade diagonal normalizada
+  let mx = inp.dx, my = inp.dy;
+  const len = Math.hypot(mx, my);
+  if (len > 0) {
+    mx /= len; my /= len;
+    facing = { x: mx, y: my };
+  }
+  moveBox(player, mx * PLAYER_SPEED * dt, my * PLAYER_SPEED * dt);
+
+  player.invuln = Math.max(0, player.invuln - dt);
+  player.cooldown = Math.max(0, player.cooldown - dt);
+  if (inp.fire && player.cooldown <= 0) shoot();
+
+  updateDarts(dt);
+  for (const en of enemies) updateEnemy(en, dt);
+
+  // Contato com dinossauro
+  if (player.invuln <= 0) {
+    for (const en of enemies) {
+      if (overlap(player, en)) { hurtPlayer(); break; }
+    }
+  }
+  if (state !== "playing") return;
+
+  // Coleta de corações
+  for (let i = hearts.length - 1; i >= 0; i--) {
+    const h = hearts[i];
+    if (Math.abs(h.x - player.x) < 10 && Math.abs(h.y - player.y) < 10) {
+      player.hp = Math.min(MAX_HP, player.hp + 1);
+      hearts.splice(i, 1);
+      sfx("pickup");
+    }
+  }
+
+  // Fase limpa quando não sobrar dinossauro
+  if (enemies.length === 0) {
+    state = "clear";
+    clearTimer = 2.0;
+    sfx("clear");
+  }
+}
+
+function update(dt) {
+  if (msgTimer > 0) msgTimer -= dt;
+
+  if (state === "playing") {
+    updatePlaying(dt);
+  } else if (state === "clear") {
+    clearTimer -= dt;
+    if (clearTimer <= 0) {
+      if (stage < 2) {
+        stage++;
+        loadStage();
+        state = "playing";
+      } else {
+        state = "win";
+      }
+    }
+  }
+}
+
+function startGame() {
+  stage = 1;
+  player = null;
+  msgTimer = 0;
+  loadStage();
+  state = "playing";
+}
+
+function onConfirm() {
+  ensureAudio();
+  if (state === "title" || state === "gameover" || state === "win") startGame();
+}
+
+/* ==================================================
+   DESENHO
+   ================================================== */
+
+function grass(x, y, tx, ty) {
+  ctx.fillStyle = "#4f8f36";
+  ctx.fillRect(x, y, TILE, TILE);
+  if (((tx * 7 + ty * 13) % 5) === 0) {
+    ctx.fillStyle = "#3d7a2a";
+    ctx.fillRect(x + 3, y + 4, 2, 2);
+    ctx.fillRect(x + 10, y + 11, 2, 2);
+  }
+}
+
+function drawTile(v, tx, ty, x, y) {
+  if (v === 0) {
+    grass(x, y, tx, ty);
+  } else if (v === 1) {            // árvore
+    grass(x, y, tx, ty);
+    ctx.fillStyle = "#5a3a1e"; ctx.fillRect(x + 6, y + 9, 4, 7);
+    ctx.fillStyle = "#1f5a22";
+    ctx.beginPath(); ctx.arc(x + 8, y + 7, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#2e7d32";
+    ctx.beginPath(); ctx.arc(x + 7, y + 6, 4, 0, Math.PI * 2); ctx.fill();
+  } else if (v === 2) {            // pedra
+    grass(x, y, tx, ty);
+    ctx.fillStyle = "#6e6e6e"; ctx.fillRect(x + 3, y + 5, 10, 8);
+    ctx.fillStyle = "#9a9a9a"; ctx.fillRect(x + 4, y + 4, 6, 3);
+  } else if (v === 3) {            // piso do lab
+    ctx.fillStyle = "#8a8f99"; ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = "#6f7480";
+    ctx.fillRect(x, y, TILE, 1);
+    ctx.fillRect(x, y, 1, TILE);
+  } else if (v === 4) {            // parede do lab
+    ctx.fillStyle = "#3a3f4b"; ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = "#c9d1db"; ctx.fillRect(x, y, TILE, 3);
+    ctx.fillStyle = "#2a2e38"; ctx.fillRect(x, y + 3, TILE, 1);
+  }
+}
+
+function drawMap() {
+  const tx0 = Math.max(0, Math.floor(camX / TILE));
+  const tx1 = Math.min(map.w - 1, Math.floor((camX + VIEW_W) / TILE));
+  const ty0 = Math.max(0, Math.floor(camY / TILE));
+  const ty1 = Math.min(map.h - 1, Math.floor((camY + VIEW_H) / TILE));
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      drawTile(map.tiles[ty * map.w + tx], tx, ty, tx * TILE - camX, ty * TILE - camY);
+    }
+  }
+}
+
+function drawHeartIcon(x, y, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x + 1, y + 1, 2, 1);
+  ctx.fillRect(x + 4, y + 1, 2, 1);
+  ctx.fillRect(x, y + 2, 7, 2);
+  ctx.fillRect(x + 1, y + 4, 5, 1);
+  ctx.fillRect(x + 2, y + 5, 3, 1);
+  ctx.fillRect(x + 3, y + 6, 1, 1);
+}
+
+// Formas desenhadas, usadas quando não há imagem de sprites
+function drawFallback(name, x, y, w, h, color) {
+  if (name === "player") {
+    ctx.fillStyle = "#6b4423"; ctx.fillRect(x + 4, y + 1, 8, 2);     // chapéu
+    ctx.fillStyle = "#e0b48a"; ctx.fillRect(x + 5, y + 3, 6, 4);     // rosto
+    ctx.fillStyle = "#b8914f"; ctx.fillRect(x + 4, y + 7, 8, 6);     // corpo
+    ctx.fillStyle = "#3a2a1a"; ctx.fillRect(x + 5, y + 13, 2, 3); ctx.fillRect(x + 9, y + 13, 2, 3);
+  } else if (name === "raptor") {
+    ctx.fillStyle = color;
+    ctx.fillRect(x + 3, y + 5, 10, 6);                               // corpo
+    ctx.fillRect(x, y + 7, 4, 2);                                    // cauda
+    ctx.fillRect(x + 11, y + 3, 4, 4);                               // cabeça
+    ctx.fillRect(x + 5, y + 11, 2, 4); ctx.fillRect(x + 9, y + 11, 2, 4); // pernas
+    ctx.fillStyle = "#2f5d24"; ctx.fillRect(x + 6, y + 6, 4, 1);     // listra
+    ctx.fillStyle = "#000";    ctx.fillRect(x + 13, y + 4, 1, 1);    // olho
+  } else if (name === "trex") {
+    ctx.fillStyle = color;
+    ctx.fillRect(x + 6, y + 8, 18, 16);
+    ctx.fillRect(x + 20, y + 4, 10, 10);
+    ctx.fillRect(x, y + 14, 8, 6);
+    ctx.fillRect(x + 8, y + 24, 5, 8);
+    ctx.fillRect(x + 17, y + 24, 5, 8);
+    ctx.fillStyle = "#fff"; ctx.fillRect(x + 24, y + 13, 2, 2);      // dentes
+    ctx.fillStyle = "#f00"; ctx.fillRect(x + 26, y + 6, 2, 2);       // olho
+  } else if (name === "heart") {
+    drawHeartIcon(x, y, "#e0282e");
+  }
+}
+
+function drawEntity(name, cx, cy, color, flip) {
+  const s = SHEET[name];
+  const x = Math.round(cx - camX - s.w / 2);
+  const y = Math.round(cy - camY - s.h / 2);
+  ctx.save();
+  ctx.translate(x + s.w / 2, y + s.h / 2);
+  if (flip) ctx.scale(-1, 1);
+  const dx = -s.w / 2, dy = -s.h / 2;
+  if (sprites.ok) {
+    ctx.drawImage(sprites.img, s.x, s.y, s.w, s.h, dx, dy, s.w, s.h);
+  } else {
+    drawFallback(name, dx, dy, s.w, s.h, color);
+  }
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(0, 0, VIEW_W, HUD_H);
+  for (let i = 0; i < MAX_HP; i++) {
+    drawHeartIcon(4 + i * 10, 4, i < player.hp ? "#e0282e" : "#4a4a4a");
+  }
+  ctx.fillStyle = "#fff";
+  ctx.font = "8px monospace";
+  ctx.textAlign = "right";
+  ctx.fillText(`FASE ${stage}  DINOS ${enemies.length}`, VIEW_W - 4, 11);
+  ctx.textAlign = "left";
+
+  // Barra de vida do T-Rex
+  const boss = enemies.find((e) => e.kind === "trex");
+  if (boss) {
+    ctx.fillStyle = "#000"; ctx.fillRect(50, HUD_H + 4, 140, 6);
+    ctx.fillStyle = "#c62828";
+    ctx.fillRect(51, HUD_H + 5, Math.round(138 * boss.hp / boss.maxHp), 4);
+    ctx.fillStyle = "#fff"; ctx.font = "7px monospace";
+    ctx.fillText("T-REX", 8, HUD_H + 10);
+  }
+}
+
+function drawTouch() {
+  const p = touchPressed();
+  for (const b of TOUCH_BTNS) {
+    ctx.beginPath();
+    ctx.arc(b.cx, b.cy, b.r, 0, Math.PI * 2);
+    ctx.fillStyle = p[b.id] ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.18)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.5)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 10px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const b of TOUCH_BTNS) ctx.fillText(b.label, b.cx, b.cy);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawTitle() {
+  ctx.fillStyle = "#1d3b1a";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 20px monospace";
+  ctx.fillText("JURASSIC", VIEW_W / 2, 110);
+  ctx.fillText("ESCAPE", VIEW_W / 2, 134);
+
+  ctx.fillStyle = "#fff";
+  ctx.font = "9px monospace";
+  ctx.fillText("Toque ou ENTER para começar", VIEW_W / 2, 175);
+
+  ctx.fillStyle = "#cfe8c4";
+  ctx.font = "8px monospace";
+  ctx.fillText("Setas / WASD: andar", VIEW_W / 2, 210);
+  ctx.fillText("Z / ENTER: atirar dardo", VIEW_W / 2, 224);
+  ctx.fillText("Derrote os dinossauros!", VIEW_W / 2, 238);
+  ctx.textAlign = "left";
+}
+
+function drawOverlay(title, color, sub) {
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = color;
+  ctx.font = "bold 18px monospace";
+  ctx.fillText(title, VIEW_W / 2, 130);
+  ctx.fillStyle = "#fff";
+  ctx.font = "9px monospace";
+  ctx.fillText(sub, VIEW_W / 2, 262);
+  ctx.textAlign = "left";
+}
+
+function drawMessage() {
+  if (msgTimer <= 0) return;
+  ctx.fillStyle = "rgba(0,0,0,0.75)";
+  ctx.fillRect(16, 140, VIEW_W - 32, 36);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 16px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(msgText, VIEW_W / 2, 158);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+function render() {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  if (state === "title") {
+    drawTitle();
+    return;
+  }
+
+  // Câmera acompanha o jogador, limitada às bordas do mapa
+  camX = Math.round(clamp(player.x - VIEW_W / 2, 0, map.w * TILE - VIEW_W));
+  camY = Math.round(clamp(player.y - VIEW_H / 2, 0, map.h * TILE - VIEW_H));
+
+  drawMap();
+
+  for (const h of hearts) drawEntity("heart", h.x, h.y, null, false);
+
+  for (const en of enemies) {
+    const flip = player.x < en.x;
+    const base = en.kind === "trex" ? "#7a5a2a" : "#6aa84f";
+    drawEntity(en.kind, en.x, en.y, en.flash > 0 ? "#ffffff" : base, flip);
+  }
+
+  ctx.fillStyle = "#ffe066";
+  for (const d of darts) {
+    ctx.fillRect(Math.round(d.x - camX) - 1, Math.round(d.y - camY) - 1, 3, 2);
+  }
+
+  // Jogador pisca enquanto está invulnerável
+  const blink = player.invuln > 0 && Math.floor(player.invuln * 10) % 2 === 0;
+  if (!blink) drawEntity("player", player.x, player.y, null, facing.x < 0);
+
+  drawHUD();
+  if (isTouch && state === "playing") drawTouch();
+
+  if (state === "clear") {
+    ctx.fillStyle = "#ffd54a";
+    ctx.font = "bold 14px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(`FASE ${stage} COMPLETA!`, VIEW_W / 2, 60);
+    ctx.textAlign = "left";
+  }
+  if (state === "gameover") drawOverlay("GAME OVER", "#ff5252", "Toque ou ENTER para recomeçar");
+  if (state === "win") drawOverlay("VOCÊ VENCEU!", "#7cff6b", "Toque ou ENTER para jogar de novo");
+
+  drawMessage();
+}
+
+/* ==================================================
+   LOOP PRINCIPAL
+   ================================================== */
+
+function frame(now) {
+  const dt = Math.min(0.033, (now - lastTime) / 1000);
+  lastTime = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
